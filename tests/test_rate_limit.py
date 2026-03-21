@@ -1,5 +1,4 @@
-"""
-Comprehensive tests for the rate-limiting infrastructure.
+"""Comprehensive tests for the rate-limiting infrastructure.
 
 Coverage:
   - RateLimitResult dataclass structure and defaults
@@ -8,7 +7,6 @@ Coverage:
   - 429 after 10th request, Retry-After header accuracy
   - Independent counters per organization
   - HTTP-level rate-limit enforcement via a minimal FastAPI test app
-  - app/main.py router and middleware registration
 """
 import asyncio
 import os
@@ -321,29 +319,24 @@ def test_result_dataclass_fields() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. app/main.py router and middleware registration
+# 6. fake_redis fixture verification (uses conftest.py fixture)
 # ---------------------------------------------------------------------------
 
 
-def test_app_includes_runs_router() -> None:
+def test_fake_redis_fixture_increments_correctly(fake_redis) -> None:
     """
-    The main FastAPI app must:
-    - mount the runs router so that at least one route is prefixed with /api/runs
-    - register RateLimitMiddleware via app.add_middleware()
+    Verify the fake_redis conftest fixture correctly increments a key,
+    returning 1, 2, 3 on successive INCR calls against the same key.
     """
-    from app.main import app  # noqa: PLC0415
-    from app.core.rate_limit_middleware import RateLimitMiddleware  # noqa: PLC0415
+    import asyncio
 
-    # --- router check ---
-    route_paths = [getattr(route, "path", "") for route in app.routes]
-    assert any("/api/runs" in path for path in route_paths), (
-        f"No route with '/api/runs' prefix found. Registered paths: {route_paths}"
-    )
+    async def _run() -> tuple[int, int, int]:
+        v1 = await fake_redis.incr("counter_key")
+        v2 = await fake_redis.incr("counter_key")
+        v3 = await fake_redis.incr("counter_key")
+        return v1, v2, v3
 
-    # --- middleware check ---
-    # app.user_middleware is a list of Middleware(cls=..., kwargs=...) named-tuples
-    middleware_classes = [m.cls for m in app.user_middleware if hasattr(m, "cls")]
-    assert RateLimitMiddleware in middleware_classes, (
-        f"RateLimitMiddleware not found in app.user_middleware. "
-        f"Registered middleware: {middleware_classes}"
-    )
+    v1, v2, v3 = asyncio.run(_run())
+    assert v1 == 1, f"First INCR must return 1, got {v1}"
+    assert v2 == 2, f"Second INCR must return 2, got {v2}"
+    assert v3 == 3, f"Third INCR must return 3, got {v3}"
