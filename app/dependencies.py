@@ -1,58 +1,117 @@
+"""
+FastAPI dependency providers.
+
+rate_limit_trigger — enforces a per-org sliding-window rate limit backed by
+Redis.  All raw Redis calls are confined to this module so that route handlers
+remain free of infrastructure concerns.
+"""
+from __future__ import annotations
+
 import logging
-from fastapi import Depends, HTTPException, Request
-from app.core.rate_limit import check_rate_limit
-from app.core.redis import get_redis_client
+import os
+import time
+from typing import Optional
+
+from fastapi import Depends, HTTPException, Request, status
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Optional Redis integration
+# ---------------------------------------------------------------------------
+# We import redis lazily so that the application can still start (and tests
+# can still run) without a live Redis instance — the dependency falls back to
+# an in-process counter in that case.
 
-async def rate_limit_trigger(
-    request: Request,
-    redis=Depends(get_redis_client),
-) -> None:
-    """FastAPI dependency that enforces per-org rate limits.
+try:
+    import redis as _redis_lib  # type: ignore
 
-    Extracts ``org_id`` from ``request.state`` (set by auth middleware) or
-    falls back to the JSON request body.  Calls :func:`check_rate_limit` and
-    raises :class:`~fastapi.HTTPException` 429 when the limit is exceeded.
+    _redis_client: Optional[_redis_lib.Redis] = _redis_lib.Redis.from_url(
+        os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        decode_responses=True,
+        socket_connect_timeout=1,
+    )
+except Exception:  # pragma: no cover
+    _redis_client = None
+
+# Fallback in-process store used when Redis is unavailable (testing / local).
+_in_process_store: dict[str, list[float]] = {}
+
+# Rate-limit configuration (can be overridden via env vars).
+_RATE_LIMIT_MAX_CALLS: int = int(os.getenv("RATE_LIMIT_MAX_CALLS", "10"))
+_RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+
+def _check_rate_limit_in_process(org_id: str) -> bool:
+    """Sliding-window rate limiter backed by a plain Python dict.
+
+    Returns *True* when the request is allowed, *False* when the limit has
+    been exceeded.
     """
-    org_id: str | None = None
+    now = time.monotonic()
+    window_start = now - _RATE_LIMIT_WINDOW_SECONDS
+    calls = _in_process_store.get(org_id, [])
+    # Evict timestamps that fall outside the current window.
+    calls = [t for t in calls if t > window_start]
+    if len(calls) >= _RATE_LIMIT_MAX_CALLS:
+        return False
+    calls.append(now)
+    _in_process_store[org_id] = calls
+    return True
 
-    # 1. Try request.state first (populated by auth middleware)
-    if hasattr(request.state, "org_id") and request.state.org_id is not None:
-        org_id = str(request.state.org_id)
-        logger.debug("rate_limit_trigger: org_id=%s from request.state", org_id)
-    else:
-        # 2. Fall back to JSON body
+
+def _check_rate_limit_redis(org_id: str) -> bool:  # pragma: no cover
+    """Sliding-window rate limiter backed by Redis sorted sets.
+
+    Returns *True* when the request is allowed, *False* when the limit has
+    been exceeded.
+    """
+    assert _redis_client is not None
+    key = f"rate_limit:trigger:{org_id}"
+    now = time.time()
+    window_start = now - _RATE_LIMIT_WINDOW_SECONDS
+
+    pipe = _redis_client.pipeline()
+    pipe.zremrangebyscore(key, "-inf", window_start)
+    pipe.zcard(key)
+    pipe.zadd(key, {str(now): now})
+    pipe.expire(key, _RATE_LIMIT_WINDOW_SECONDS + 1)
+    results = pipe.execute()
+
+    current_count: int = results[1]  # count *before* adding the new entry
+    if current_count >= _RATE_LIMIT_MAX_CALLS:
+        # Roll back the zadd we just performed.
+        _redis_client.zrem(key, str(now))
+        return False
+    return True
+
+
+async def rate_limit_trigger(request: Request) -> None:
+    """FastAPI dependency that enforces per-org rate limiting for the trigger
+    endpoint.
+
+    The *org_id* is extracted from the JSON request body.  A 429 response is
+    returned when the caller has exceeded the allowed call rate.
+    """
+    try:
+        body = await request.json()
+        org_id: str = body.get("org_id", "__unknown__")
+    except Exception:
+        org_id = "__unknown__"
+
+    allowed: bool
+    if _redis_client is not None:
         try:
-            body = await request.json()
-            if isinstance(body, dict) and body.get("org_id") is not None:
-                org_id = str(body["org_id"])
-                logger.debug(
-                    "rate_limit_trigger: org_id=%s from request body", org_id
-                )
-        except Exception:
-            # Body may be absent or non-JSON — treat org_id as None
-            pass
-
-    if org_id is None:
-        logger.debug(
-            "rate_limit_trigger: no org_id found, skipping rate-limit check"
-        )
-        return
-
-    result = await check_rate_limit(redis, org_id)
-    allowed: bool = result.get("allowed", True)
-    retry_after: int = result.get("retry_after", 0)
+            allowed = _check_rate_limit_redis(org_id)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Redis rate-limit check failed, falling back to in-process: %s", exc)
+            allowed = _check_rate_limit_in_process(org_id)
+    else:
+        allowed = _check_rate_limit_in_process(org_id)
 
     if not allowed:
-        logger.warning(
-            "rate_limit_trigger: rate limit exceeded for org_id=%s retry_after=%s",
-            org_id,
-            retry_after,
-        )
+        logger.warning("Rate limit exceeded for org_id=%s", org_id)
         raise HTTPException(
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-            detail="Rate limit exceeded",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded for org '{org_id}'. Please retry later.",
         )
