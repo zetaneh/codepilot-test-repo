@@ -15,7 +15,6 @@ class Todo(BaseModel):
 class TodoCreate(BaseModel):
     title: str
     description: Optional[str] = None
-    user_id: int
 
 
 class TodoUpdate(BaseModel):

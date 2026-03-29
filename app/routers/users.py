@@ -1,16 +1,17 @@
-from fastapi import APIRouter, HTTPException
-from app.models.user import UserCreate, UserUpdate
+from fastapi import APIRouter, HTTPException, Depends
+from app.models.user import UserCreate, UserUpdate, User
 from app.services import user_service
+from app.auth import get_current_active_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_active_user)])
 
 
-@router.get("/")
+@router.get("/", response_model=list[User])
 def list_users():
     return user_service.list_users()
 
 
-@router.get("/{user_id}")
+@router.get("/{user_id}", response_model=User)
 def get_user(user_id: int):
     user = user_service.get_user(user_id)
     if not user:
@@ -18,12 +19,7 @@ def get_user(user_id: int):
     return user
 
 
-@router.post("/", status_code=201)
-def create_user(data: UserCreate):
-    return user_service.create_user(data)
-
-
-@router.patch("/{user_id}")
+@router.patch("/{user_id}", response_model=User)
 def update_user(user_id: int, data: UserUpdate):
     user = user_service.update_user(user_id, data)
     if not user:
