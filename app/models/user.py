@@ -5,8 +5,12 @@ from typing import Optional
 class User(BaseModel):
     id: int
     name: str
-    email: str
+    email: EmailStr
     is_active: bool = True
+
+
+class UserInDB(User):
+    hashed_password: str
 
 
 class UserCreate(BaseModel):
