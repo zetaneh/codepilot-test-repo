@@ -11,10 +11,11 @@ class User(BaseModel):
 
 class UserCreate(BaseModel):
     name: str
-    email: str
+    email: EmailStr
+    password: str
 
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     is_active: Optional[bool] = None
